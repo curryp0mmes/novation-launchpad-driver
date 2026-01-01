@@ -17,43 +17,26 @@
 
 #include "protocol.h"
 
-/* These should be in your protocol.h, defining them here as fallbacks */
-#ifndef LP_OPTION
-#define LP_OPTION       0xF0
-#define LP_GET_STAT     0x01
-#define LP_GET_VERSION  0x02
-#define LP_IS_UNPLUG    0x03
-#define LP_MENU         0xB0
-#define LP_GRID         0x90
-#endif
-
 #define DRIVER_NAME     "novalpdrv"
-#define DRIVER_VERSION  "2.0"
 #define VENDOR_ID       0x1235
 #define PRODUCT_ID      0x000e
-
 #define DATA_BUF_SIZE   256
 #define WRITE_BUF_SIZE  8
 
-/* Device structure */
 struct novation_lp {
     struct usb_device *udev;
     struct usb_interface *interface;
     struct usb_endpoint_descriptor *in_endpoint;
     struct usb_endpoint_descriptor *out_endpoint;
-    
     struct urb *urb_in;
     unsigned char *in_buffer;
-    
     unsigned char *data_buffer;
     size_t data_pos;
-    
-    struct mutex io_mutex;           /* Sync for I/O operations */
-    wait_queue_head_t wait_q;        /* For poll/read waiting */
-    
-    bool disconnected;               /* Flag for hot-unplug */
-    bool is_open;                    /* Is char device open */
-    unsigned char last_stat;         /* Last state (Menu or Grid) */
+    struct mutex io_mutex;
+    wait_queue_head_t wait_q;
+    bool disconnected;
+    bool is_open;
+    unsigned char last_stat;
 };
 
 static struct usb_device_id lp_table[] = {
@@ -62,14 +45,8 @@ static struct usb_device_id lp_table[] = {
 };
 MODULE_DEVICE_TABLE(usb, lp_table);
 
-/* --- Helpers --- */
-
-static void lp_abort_transfers(struct novation_lp *dev) {
-    if (dev->urb_in)
-        usb_kill_urb(dev->urb_in);
-}
-
-/* --- Callbacks --- */
+/* Forward declaration for the driver struct */
+static struct usb_driver lp_driver;
 
 static void lp_read_callback(struct urb *urb) {
     struct novation_lp *dev = urb->context;
@@ -85,48 +62,38 @@ static void lp_read_callback(struct urb *urb) {
 
     if (len > 0) {
         mutex_lock(&dev->io_mutex);
-        
-        /* Store data in the buffer if there's room */
         if (dev->data_pos + len < DATA_BUF_SIZE) {
             memcpy(&dev->data_buffer[dev->data_pos], data, len);
             dev->data_pos += len;
         }
-
-        /* Update internal state if it matches specific MIDI headers */
         for (int i = 0; i < len; i++) {
             if (data[i] == LP_MENU || data[i] == LP_GRID)
                 dev->last_stat = data[i];
         }
-
         mutex_unlock(&dev->io_mutex);
         wake_up_interruptible(&dev->wait_q);
     }
 
-    /* Resubmit URB */
     if (!dev->disconnected) {
-        status = usb_submit_urb(dev->urb_in, GFP_ATOMIC);
-        if (status)
-            dev_err(&dev->interface->dev, "Resubmit URB failed: %d\n", status);
+        if (usb_submit_urb(dev->urb_in, GFP_ATOMIC))
+            dev_err(&dev->interface->dev, "Resubmit URB failed\n");
     }
 }
 
 static void lp_write_callback(struct urb *urb) {
     struct novation_lp *dev = urb->context;
-
     if (urb->status && !(urb->status == -ENOENT || urb->status == -ECONNRESET || urb->status == -ESHUTDOWN))
         dev_err(&dev->interface->dev, "Write URB error: %d\n", urb->status);
-
     usb_free_coherent(urb->dev, urb->transfer_buffer_length, urb->transfer_buffer, urb->transfer_dma);
 }
-
-/* --- File Operations --- */
 
 static int lp_open(struct inode *inode, struct file *file) {
     struct novation_lp *dev;
     struct usb_interface *interface;
     int subminor = iminor(inode);
 
-    interface = usb_find_interface(&lp_table[0].driver_info ? NULL : (struct usb_driver *)&lp_table, subminor);
+    /* FIX: Simplified interface lookup */
+    interface = usb_find_interface(&lp_driver, subminor);
     if (!interface) return -ENODEV;
 
     dev = usb_get_intfdata(interface);
@@ -148,12 +115,11 @@ static int lp_open(struct inode *inode, struct file *file) {
 
 static int lp_release(struct inode *inode, struct file *file) {
     struct novation_lp *dev = file->private_data;
-    if (!dev) return -ENODEV;
-
-    mutex_lock(&dev->io_mutex);
-    dev->is_open = false;
-    mutex_unlock(&dev->io_mutex);
-
+    if (dev) {
+        mutex_lock(&dev->io_mutex);
+        dev->is_open = false;
+        mutex_unlock(&dev->io_mutex);
+    }
     return 0;
 }
 
@@ -180,7 +146,6 @@ static ssize_t lp_read(struct file *file, char __user *buffer, size_t count, lof
     if (copy_to_user(buffer, dev->data_buffer, avail)) {
         retval = -EFAULT;
     } else {
-        /* Shift buffer */
         if (avail < dev->data_pos)
             memmove(dev->data_buffer, &dev->data_buffer[avail], dev->data_pos - avail);
         dev->data_pos -= avail;
@@ -225,14 +190,10 @@ static ssize_t lp_write(struct file *file, const char __user *user_buf, size_t c
                      buf, count, lp_write_callback, dev, dev->out_endpoint->bInterval);
     
     urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-
     retval = usb_submit_urb(urb, GFP_KERNEL);
     mutex_unlock(&dev->io_mutex);
 
-    if (retval) {
-        dev_err(&dev->interface->dev, "Failed to submit write URB: %d\n", retval);
-        goto error;
-    }
+    if (retval) goto error;
 
     usb_free_urb(urb);
     return count;
@@ -246,14 +207,11 @@ error:
 static __poll_t lp_poll(struct file *file, poll_table *wait) {
     struct novation_lp *dev = file->private_data;
     __poll_t mask = 0;
-
     poll_wait(file, &dev->wait_q, wait);
-
     mutex_lock(&dev->io_mutex);
     if (dev->data_pos > 0) mask |= POLLIN | POLLRDNORM;
     if (dev->disconnected) mask |= POLLHUP | POLLERR;
     mutex_unlock(&dev->io_mutex);
-
     return mask;
 }
 
@@ -272,8 +230,6 @@ static struct usb_class_driver lp_class = {
     .minor_base = 0,
 };
 
-/* --- Probe & Disconnect --- */
-
 static int lp_probe(struct usb_interface *interface, const struct usb_device_id *id) {
     struct usb_device *udev = interface_to_usbdev(interface);
     struct novation_lp *dev;
@@ -285,7 +241,8 @@ static int lp_probe(struct usb_interface *interface, const struct usb_device_id 
     if (!dev) return -ENOMEM;
 
     mutex_init(&dev->io_mutex);
-    init_wait_queue_head(&dev->wait_q);
+    /* FIX: Corrected function name */
+    init_waitqueue_head(&dev->wait_q);
 
     dev->udev = udev;
     dev->interface = interface;
@@ -294,15 +251,11 @@ static int lp_probe(struct usb_interface *interface, const struct usb_device_id 
     iface_desc = interface->cur_altsetting;
     for (int i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
         endpoint = &iface_desc->endpoint[i].desc;
-
-        if (usb_endpoint_is_int_in(endpoint))
-            dev->in_endpoint = endpoint;
-        if (usb_endpoint_is_int_out(endpoint))
-            dev->out_endpoint = endpoint;
+        if (usb_endpoint_is_int_in(endpoint)) dev->in_endpoint = endpoint;
+        if (usb_endpoint_is_int_out(endpoint)) dev->out_endpoint = endpoint;
     }
 
     if (!dev->in_endpoint || !dev->out_endpoint) {
-        dev_err(&interface->dev, "Could not find endpoints\n");
         retval = -ENODEV;
         goto error;
     }
@@ -316,17 +269,12 @@ static int lp_probe(struct usb_interface *interface, const struct usb_device_id 
                      lp_read_callback, dev, dev->in_endpoint->bInterval);
 
     usb_set_intfdata(interface, dev);
-
     retval = usb_register_dev(interface, &lp_class);
-    if (retval) {
-        dev_err(&interface->dev, "Not able to get a minor for this device.\n");
-        goto error;
-    }
+    if (retval) goto error;
 
     retval = usb_submit_urb(dev->urb_in, GFP_KERNEL);
     if (retval) goto error;
 
-    dev_info(&interface->dev, "Launchpad connected to /dev/nlp%d\n", interface->minor);
     return 0;
 
 error:
@@ -339,21 +287,18 @@ error:
 
 static void lp_disconnect(struct usb_interface *interface) {
     struct novation_lp *dev = usb_get_intfdata(interface);
-
-    mutex_lock(&dev->io_mutex);
-    dev->disconnected = true;
-    mutex_unlock(&dev->io_mutex);
-
-    usb_deregister_dev(interface, &lp_class);
-    lp_abort_transfers(dev);
-    usb_set_intfdata(interface, NULL);
-
-    kfree(dev->in_buffer);
-    kfree(dev->data_buffer);
-    usb_free_urb(dev->urb_in);
-    kfree(dev);
-
-    dev_info(&interface->dev, "Launchpad disconnected\n");
+    if (dev) {
+        mutex_lock(&dev->io_mutex);
+        dev->disconnected = true;
+        mutex_unlock(&dev->io_mutex);
+        usb_deregister_dev(interface, &lp_class);
+        if (dev->urb_in) usb_kill_urb(dev->urb_in);
+        usb_set_intfdata(interface, NULL);
+        kfree(dev->in_buffer);
+        kfree(dev->data_buffer);
+        usb_free_urb(dev->urb_in);
+        kfree(dev);
+    }
 }
 
 static struct usb_driver lp_driver = {
@@ -364,7 +309,4 @@ static struct usb_driver lp_driver = {
 };
 
 module_usb_driver(lp_driver);
-
-MODULE_AUTHOR("Vincent Deca / Modernized for NixOS");
-MODULE_DESCRIPTION("Modernized Driver for Novation Launchpad (NVLPD01)");
 MODULE_LICENSE("GPL");
